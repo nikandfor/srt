@@ -1,14 +1,15 @@
 package srt
 
 import (
-	"bytes"
-	"encoding/binary"
+	"context"
 	"encoding/hex"
+	"math/rand"
 	"net"
 	"time"
 	"unsafe"
 
 	"github.com/nikandfor/errors"
+	"github.com/nikandfor/srt/wire"
 	"github.com/nikandfor/tlog"
 	"github.com/nikandfor/tlog/low"
 )
@@ -17,30 +18,71 @@ type (
 	Listener struct {
 		p net.PacketConn
 
-		socks map[uint32]*Conn
+		Encryption int
+
+		MaxTransmissonUnit int
+		MaxFlowWindow      int
+
+		//	mu sync.Mutex
+
+		socks map[sockkey]*Conn
+		conng map[uint32]*connreq
+
+		rand *rand.Rand
+
+		// end of mu
 
 		acceptc chan *Conn
 
 		stopc chan struct{}
 	}
+
+	sockkey struct {
+		ip   [16]byte
+		port uint16
+		sid  uint32
+	}
+
+	sender struct {
+		net.PacketConn
+	}
+
+	conndata struct {
+		tp uint32
+
+		lid uint32
+		rid uint32
+
+		lseq uint32
+		rseq uint32
+	}
+
+	connreq struct {
+		id   uint32
+		errc chan error
+		c    *Conn
+	}
+
+	testAddr string
 )
 
-var _ net.Listener = &Listener{}
+func newListener(p net.PacketConn) (l *Listener) {
+	return &Listener{
+		p: p,
 
-var handshakeHeader []byte
+		MaxTransmissonUnit: 1500,
+		MaxFlowWindow:      0x2000,
 
-func init() {
-	handshakeHeader = make([]byte, 8)
-	handshakeHeader[0] = controlPacket
-}
-
-func NewListener(p net.PacketConn) (l *Listener) {
-	l = &Listener{
-		p:       p,
-		socks:   make(map[uint32]*Conn),
-		acceptc: make(chan *Conn, 16),
+		socks:   make(map[sockkey]*Conn),
+		conng:   make(map[uint32]*connreq),
+		rand:    rand.New(rand.NewSource(time.Now().UnixNano())),
+		acceptc: make(chan *Conn, 2),
 		stopc:   make(chan struct{}),
 	}
+}
+
+func New(p net.PacketConn) (l *Listener) {
+	l = newListener(p)
 
 	go func() {
 		for {
@@ -66,6 +108,301 @@ func (l *Listener) Addr() net.Addr {
 func (l *Listener) Close() (err error) {
 	close(l.stopc)
 
+	return
+}
+
+func (l *Listener) Connect(ctx context.Context, addr net.Addr) (_ *Conn, err error) {
+	req := connreq{
+		id:   uint32(l.rand.Int31()),
+		errc: make(chan error, 1),
+	}
+
+	l.conng[req.id] = &req
+
+	defer func() {
+		delete(l.conng, req.id)
+	}()
+
+	tlog.Printw("connect as", "streamid", tlog.Hex(req.id))
+
+	p := l.newHandshake(wire.Induction, req.id)
+
+	_, err = l.WriteTo(p, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case err = <-req.errc:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return req.c, nil
+}
+
+func (l *Listener) run() (err error) {
+	for {
+		err = l.readPacket()
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (l *Listener) readPacket() (err error) {
+	buf := make(wire.Packet, 2000)
+
+	n, addr, err := l.p.ReadFrom(buf)
+	if err != nil {
+		return errors.Wrap(err, "read packet")
+	}
+
+	buf = buf[:n]
+
+	ts := low.Monotonic()
+
+	if tlog.If("raw") {
+		tlog.Printf("packet from %v\n%s", addr, hex.Dump(buf))
+	}
+
+	if n < buf.MinSize() {
+		return errors.New("short packet")
+	}
+
+	sid := buf.SocketID()
+
+	if buf.Handshake() {
+		err = l.handleHandshake(wire.Handshake(buf), addr, ts)
+
+		return errors.Wrap(err, "handshake")
+	}
+
+	c := l.socks[key(addr, sid)]
+
+	if c == nil {
+		return errors.New("no socket")
+	}
+
+	err = c.recv(buf[:n], addr, ts)
+	if err != nil {
+		return errors.Wrap(err, "recv: sid %x", sid)
+	}
+
+	return nil
+}
+
+func (l *Listener) handleHandshake(p wire.Handshake, addr net.Addr, ts int64) (err error) {
+	dstid := wire.Packet(p).SocketID()
+
+	var d conndata
+	p, d, err = l.parseHandshake(p, addr, ts)
+
+	req, reqok := l.conng[d.lid]
+	if reqok {
+		defer func() {
+			if err != nil {
+				req.errc <- err
+			}
+		}()
+	}
+
+	if err != nil {
+		return errors.Wrap(err, "parse")
+	}
+
+	tlog.Printw("handshake", "tp_conclusion", d.tp == wire.Conclusion, "local_sid", tlog.Hex(dstid))
+
+	if d.tp != wire.Conclusion || dstid == 0 {
+		_, err = l.WriteTo(p, addr)
+		if err != nil {
+			return errors.Wrap(err, "send resp")
+		}
+	}
+
+	if d.tp != wire.Conclusion {
+		return nil
+	}
+
+	c := &Conn{
+		p:        sender{PacketConn: l.p},
+		addr:     addr,
+		localid:  d.lid,
+		remoteid: d.rid,
+
+		epoch: ts,
+
+		readnotify: make(chan struct{}, 1),
+	}
+
+	c.s.seq = d.lseq
+	c.r.seq = d.rseq
+
+	if reqok {
+		req.c = c
+		req.errc <- nil
+
+		return nil
+	}
+
+	err = l.accepted(c, addr)
+	if err != nil {
+		return errors.Wrap(err, "accept")
+	}
+
+	return nil
+}
+
+func (l *Listener) accepted(c *Conn, addr net.Addr) (err error) {
+	select {
+	case l.acceptc <- c:
+	default:
+		panic("stop")
+		return errors.New("full buffer")
+	}
+
+	l.socks[key(addr, c.localid)] = c
+
+	return nil
+}
+
+func (l *Listener) newHandshake(tp int, id uint32) (p wire.Handshake) {
+	p = make(wire.Handshake, wire.Handshake{}.MinSize()) // first req
+
+	wire.Packet(p).SetControlType(wire.HandshakeType, 0)
+
+	if tp == wire.Induction {
+		p.SetVersion(4)
+		p.SetExtensions(2)
+	} else {
+		p.SetVersion(5)
+	}
+
+	p.SetMaxTransmissionUnit(uint32(l.MaxTransmissonUnit))
+	p.SetMaxFlowWindow(uint32(l.MaxFlowWindow))
+
+	p.SetType(uint32(tp))
+
+	p.SetSocketID(id)
+
+	return p
+}
+
+func (l *Listener) parseHandshake(p wire.Handshake, addr net.Addr, ts int64) (_ wire.Handshake, d conndata, err error) {
+	err = l.checkHandshake(p, addr, ts)
+	if err != nil {
+		return nil, d, errors.Wrap(err, "check packet")
+	}
+
+	ver := p.Version()
+
+	defer func() {
+		if err != nil {
+			err = errors.Wrap(err, "%x", ver)
+		}
+	}()
+
+	dst := wire.Packet(p).SocketID()
+
+	d.tp = p.Type()
+	cookie := p.Cookie()
+
+	wire.Packet(p).SetSocketID(p.SocketID())
+
+	p, err = l.procExts(p, &d)
+	if err != nil {
+		return nil, d, errors.Wrap(err, "extensions")
+	}
+
+	switch {
+	case ver == 4 && d.tp == wire.Induction: // first resp
+		if p.Extensions() != 2 {
+			return nil, d, errors.New("bad extension")
+		}
+
+		p.SetExtensions(wire.Magic)
+
+		if cookie != 0 {
+			return nil, d, errors.New("bad cookie")
+		}
+
+		cookie = calcCookie(addr, ts)
+		p.SetCookie(cookie)
+		p.SetSocketID(0)
+	case ver == 5 && d.tp == wire.Induction: // second req
+		p.SetType(wire.Conclusion)
+
+		p.SetSocketID(dst)
+
+		ext := make(wire.Ext, wire.HandshakeExt{}.Size())
+
+		ext.SetHeader(1, wire.HandshakeExt{}.Size())
+		wire.HandshakeExt(ext).SetVersion(1, 4, 0)
+		wire.HandshakeExt(ext).SetFlags(0)
+
+		p = append(p, ext...)
+
+		p = append(p, []byte{0x00, 0x06, 0x00, 0x01, 'e', 'l', 'i', 'f'}...)
+	case ver == 5 && d.tp == wire.Conclusion: // second resp
+		if cookie == 0 {
+			return nil, d, errors.New("bad cookie")
+		}
+
+		d.lid = uint32(l.rand.Int31())
+		d.rid = p.SocketID()
+
+		d.lseq = uint32(l.rand.Int31())
+		d.rseq = p.Seq() - 1
+
+		p.SetSeq(d.lseq)
+		p.SetSocketID(d.lid)
+	default:
+		return nil, d, errors.New("bad handshake")
+	}
+
+	p.SetVersion(5)
+	p.SetEncryption(uint16(l.Encryption))
+
+	p.SetMaxTransmissionUnit(uint32(l.MaxTransmissonUnit))
+	p.SetMaxFlowWindow(uint32(l.MaxFlowWindow))
+
+	return p, d, nil
+}
+
+func (l *Listener) procExts(p wire.Handshake, d *conndata) (_ wire.Handshake, err error) {
+	for st := p.ExtStart(); st < len(p); {
+		tp, _, next := p.Ext(st)
+
+		switch tp {
+		case 1: // handshake request
+			p[st+1] = 2 // resp
+		case 6: // congestion
+		}
+
+		if next == -1 {
+			return nil, errors.New("bad extension: %x at %x", tp, st)
+		}
+
+		st = next
+	}
+
+	return p, nil
+}
+
+func (l *Listener) checkHandshake(p wire.Handshake, addr net.Addr, ts int64) (err error) {
+	if len(p) < p.MinSize() {
+		return errors.New("too short")
+	}
+
+	enc := p.Encryption()
+	if enc != wire.NoEncryption {
+		return errors.New("bad encryption")
+	}
+
 	return nil
 }
 
@@ -73,250 +410,18 @@ func (l *Listener) Accept() (c net.Conn, err error) {
 	select {
 	case c = <-l.acceptc:
 	case <-l.stopc:
-		err = errors.New("stopped")
+		return nil, errors.New("stopped")
 	}
-
-	return c, err
-}
-
-func (l *Listener) Connect(addr net.Addr) (c *Conn, err error) {
-	c = NewConn(l.p, addr)
-	err = c.Connect()
-
-	return c, err
-}
-
-func (l *Listener) run() error {
-	for {
-		buf := make([]byte, 2000)
-
-		n, addr, err := l.p.ReadFrom(buf)
-		if err != nil {
-			return errors.Wrap(err, "read packet")
-		}
-
-		ts := low.Monotonic()
-
-		tlog.Printf("packet from %v\n%s", addr, hex.Dump(buf[:n]))
-
-		sid, err := l.sockID(buf[:n])
-		if err != nil {
-			return errors.Wrap(err, "sockid")
-		}
-
-		if sid == 0 {
-			err = l.accept(buf[:n], addr, ts)
-			if err != nil {
-				return errors.Wrap(err, "accept")
-			}
-
-			continue
-		}
-
-		s := l.socks[sid]
-		if s == nil {
-			return errors.Wrap(err, "unknown socket id: %x", sid)
-		}
-
-		err = s.recv(buf[:n], addr, ts)
-		if err != nil {
-			return errors.Wrap(err, "socket: recv")
-		}
-	}
-
-	return nil
-}
-
-func (l *Listener) accept(b []byte, addr net.Addr, ts int64) (err error) {
-	b, sid, err := l.respondInduct(b, addr, ts)
-	if err != nil {
-		return errors.Wrap(err, "parse induction")
-	}
-
-	_, err = send(tlog.Span{Logger: tlog.DefaultLogger}, l.p, b, addr)
-	if err != nil {
-		return errors.Wrap(err, "send induction resp")
-	}
-
-	if sid == 0 {
-		return nil
-	}
-
-	c := NewConn(l.p, addr)
-
-	select {
-	case l.acceptc <- c:
-	default:
-		return errors.Wrap(err, "accept queue is full")
-	}
-
-	l.socks[sid] = c
-
-	return nil
-}
-
-func (l *Listener) respondInduct(b []byte, addr net.Addr, ts int64) (_ []byte, sid uint32, err error) {
-	if len(b) < 16*4 || !bytes.Equal(b[:8], handshakeHeader) {
-		err = errors.New("not a handshake packet")
-		return
-	}
-
-	var ver uint32
-
-	defer func() {
-		if err == nil {
-			return
-		}
-
-		err = errors.Wrap(err, "ver %x", ver)
-	}()
-
-	// ts
-	// socket id is already checked
-
-	i := headerSize
-
-	ver = binary.BigEndian.Uint32(b[i:])
-	binary.BigEndian.PutUint32(b[i:], 5)
-	i += 4
-
-	{
-		enc := binary.BigEndian.Uint16(b[i:])
-		if enc != noEncryption {
-			err = errors.New("bad encryption")
-			return
-		}
-
-		// TODO: advertise encryption
-
-		i += 2
-	}
-
-	ext := binary.BigEndian.Uint16(b[i:])
-	binary.BigEndian.PutUint16(b[i:], 0x4A17) // magic code
-	i += 2
-
-	//	seq := binary.BigEndian.Uint32(b[i:])
-	i += 4
-
-	//	mtu := binary.BigEndian.Uint32(b[i:])
-	i += 4
-
-	//	mfw := binary.BigEndian.Uint32(b[i:])
-	i += 4
-
-	ht := binary.BigEndian.Uint32(b[i:])
-	//	binary.BigEndian.PutUint32(b[i:], induction)
-	i += 4
-
-	{
-		sid = binary.BigEndian.Uint32(b[i:])
-
-		copy(b[0xc:0x10], b[i:])
-
-		binary.BigEndian.PutUint32(b[i:], sid) // TODO: random our socker id?
-
-		i += 4
-	}
-
-	cookie := binary.BigEndian.Uint32(b[i:])
-	ccookie := calcCookie(addr, ts)
-
-	tlog.Printw("calc cookie", "cookie", tlog.Hex(ccookie), "got_cookie", tlog.Hex(cookie), "addr", addr, "ts_min", ts/int64(time.Minute))
-
-	switch {
-	case ver == 4 && ht == induction:
-		if ext != kmReq {
-			err = errors.New("bad kmreq")
-			return
-		}
-
-		if cookie != 0 {
-			err = errors.New("non-zero cookie")
-			return
-		}
-
-		binary.BigEndian.PutUint32(b[i:], ccookie)
-
-		sid = 0 // it's returned and non-zero means second step
-	case ver == 5 && ht == conclusion:
-		if cookie != ccookie {
-			err = errors.New("bad cookie")
-			return
-		}
-
-		if sid == 0 {
-			err = errors.New("zero socket id")
-			return
-		}
-
-		binary.BigEndian.PutUint32(b[i:], 0)
-	default:
-		err = errors.New("bad handshake type")
-		return
-	}
-
-	i += 4 // cookie
-
-	// source ip
-	i += 16
-
-	// extension
-	for i < len(b) {
-		if i+4 > len(b) {
-			err = errors.New("bad ext")
-			return
-		}
-
-		exttp := binary.BigEndian.Uint16(b[i:])
-		i += 2
-		extlen := binary.BigEndian.Uint16(b[i:])
-		i += 2
-
-		if i+4*int(extlen) > len(b) {
-			err = errors.New("bad ext len: %x+%x > %x", i, 4*int(extlen), len(b))
-			return
-		}
-
-		st := i
-
-		//	tlog.Printw("ext", "ext", tlog.Hex(exttp), "len", tlog.Hex(extlen), "st", tlog.Hex(st), "end", tlog.Hex(st+4*int(extlen)), "buf", tlog.Hex(len(b)))
-
-		switch exttp {
-		case 1: // handshake req
-			i -= 4
-
-			binary.BigEndian.PutUint16(b[i:], 2) // resp
-			i += 2
-
-			i += 2 // len
-
-			//	copy(b[i:], libver)
-			i += 4
-		case 6: // congestion config
-			tlog.Printw("congestion alg", "alg", string(b[i:i+4*int(extlen)]))
-		}
-
-		i = st + 4*int(extlen)
-	}
-
-	return b, sid, nil
-}
-
-func (l *Listener) sockID(p []byte) (id uint32, err error) {
-	if len(p) < 0x10 {
-		return 0, errors.Wrap(err, "short msg")
-	}
-
-	id = binary.BigEndian.Uint32(p[0xc:])
 
 	return
 }
 
-func send(tr tlog.Span, p net.PacketConn, b []byte, addr net.Addr) (n int, err error) {
-	n, err = p.WriteTo(b, addr)
+func (l *Listener) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	n, err = l.p.WriteTo(p, addr)
 
-	tlog.Printf("packet to  %v err %v\n%s", addr, err, hex.Dump(b))
+	if tlog.If("raw") {
+		tlog.Printf("packet to   %v\n%s", addr, hex.Dump(p))
+	}
 
 	return
 }
@@ -330,4 +435,32 @@ func calcCookie(a net.Addr, ts int64) (c uint32) {
 	h = low.MemHash64(unsafe.Pointer(&ts), h)
 
 	return uint32(h)
+}
+
+func key(addr net.Addr, sid uint32) (k sockkey) {
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		copy(k.ip[:], a.IP.To16())
+		k.port = uint16(a.Port)
+	case testAddr:
+	default:
+		panic(addr)
+	}
+
+	k.sid = sid
+
+	return
+}
+
+func (a testAddr) Network() string { return "testing" }
+func (a testAddr) String() string  { return string(a) }
+
+func (s sender) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	n, err = s.PacketConn.WriteTo(p, addr)
+
+	if tlog.If("raw") {
+		tlog.Printf("packet to   %v => %v %v\n%s", addr, n, err, hex.Dump(p))
+	}
+
+	return
 }

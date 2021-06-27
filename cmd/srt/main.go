@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"io"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 
 	"github.com/nikandfor/cli"
@@ -36,16 +38,20 @@ func main() {
 		},
 		Commands: []*cli.Command{{
 			Name: "file",
-			Flags: []*cli.Flag{
-				cli.NewFlag("addr", ":8090", "addr"),
-				cli.NewFlag("file", "tmpfile", "file name"),
-			},
 			Commands: []*cli.Command{{
 				Name:   "send",
 				Action: filesend,
+				Flags: []*cli.Flag{
+					cli.NewFlag("addr", "localhost:8090", "addr"),
+					cli.NewFlag("file", "go.mod", "file name"),
+				},
 			}, {
 				Name:   "recv",
 				Action: filerecv,
+				Flags: []*cli.Flag{
+					cli.NewFlag("addr", "localhost:8090", "addr"),
+					cli.NewFlag("file", "/dev/tty", "file name"),
+				},
 			}},
 		}, {
 			Name:   "proxy",
@@ -106,7 +112,13 @@ func filerecv(c *cli.Command) (err error) {
 		}
 	}()
 
-	l := srt.NewListener(p)
+	l := srt.New(p)
+	defer func() {
+		e := l.Close()
+		if err == nil {
+			err = errors.Wrap(e, "close listener")
+		}
+	}()
 
 	tlog.Printw("listening", "addr", l.Addr())
 
@@ -167,11 +179,11 @@ func filesend(c *cli.Command) (err error) {
 		}
 	}()
 
-	s := srt.NewConn(p.(net.PacketConn), addr)
+	l := srt.New(p)
 
-	tlog.Printw("connecting", "addr", s.RemoteAddr())
+	tlog.Printw("connecting", "addr", addr)
 
-	err = s.Connect()
+	s, err := l.Connect(context.Background(), addr)
 	if err != nil {
 		return errors.Wrap(err, "connect")
 	}

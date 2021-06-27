@@ -41,15 +41,20 @@ func main() {
 		},
 		Commands: []*cli.Command{{
 			Name: "file",
-			Flags: []*cli.Flag{
-				cli.NewFlag("file", "tmpfile", "file name"),
-			},
 			Commands: []*cli.Command{{
 				Name:   "send",
 				Action: filesend,
+				Flags: []*cli.Flag{
+					cli.NewFlag("addr", "localhost:8090", "addr"),
+					cli.NewFlag("file", "go.mod", "file name"),
+				},
 			}, {
 				Name:   "recv",
 				Action: filerecv,
+				Flags: []*cli.Flag{
+					cli.NewFlag("addr", "localhost:8090", "addr"),
+					cli.NewFlag("file", "/dev/tty", "file name"),
+				},
 			}},
 		}},
 	}
@@ -95,7 +100,7 @@ func before(c *cli.Command) (err error) {
 		tlog.Printw(msg, "area", area, "lvl", lvl)
 	})
 
-	srtgo.SrtSetLogLevel(srtgo.SrtLogLevelDebug)
+	srtgo.SrtSetLogLevel(srtgo.SrtLogLevelTrace)
 
 	return nil
 }

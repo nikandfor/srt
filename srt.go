@@ -1,185 +1,42 @@
 package srt
 
 import (
-	"encoding/binary"
-	"encoding/hex"
-	"math/rand"
+	"io"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/nikandfor/errors"
+	"github.com/nikandfor/srt/wire"
 	"github.com/nikandfor/tlog"
 	"github.com/nikandfor/tlog/low"
 )
 
 type (
 	Conn struct {
+		net.Conn
+
 		p    net.PacketConn
 		addr net.Addr
 
-		localID  uint32
-		remoteID uint32
-		epoch    int64 // monotonic nanoseconds
+		localid  uint32
+		remoteid uint32
 
-		MaxTransmissonUnit int
-		MaxFlowWindow      int
-
-		BufferLatency time.Duration
+		epoch int64
 
 		mu sync.Mutex
 
-		seq uint32
-		msg uint32
+		s queue
+		r queue
 
-		sendq queue
-		recvq queue
-
-		// end of mu
-
-		stream bool
-
-		stopc chan struct{}
-	}
-
-	queue struct {
-		first *msg
-		last  *msg
-	}
-
-	msg struct {
-		ts uint32
-
-		seq uint32
-		msg uint32
-
-		size int
-
-		flags byte
-
-		data []byte
-
-		buf []byte
-
-		next *msg
+		readnotify chan struct{}
 	}
 )
 
-const controlPacket = 0x80
+var ErrShortBuffer = io.ErrShortBuffer
 
-// Control Types.
-const (
-	handshake = iota
-	keepAlive
-	ack
-	nak
-	congestionWarning
-	shutdown
-	ackack
-	dropReq
-	peerError
+var errWait = errors.New("wait")
 
-	userDefined = 0x7fff
-)
-
-// data flags
-const (
-	flagPPFirst = 0b0000_0001
-	flagPPLast  = 0b0000_0010
-	flagO       = 0b0000_0100
-	flagKKMask  = 0b0001_1000
-	flagR       = 0b0010_0000
-)
-
-// Encryption schemes.
-const (
-	noEncryption = iota
-	aes128
-	aes192
-	aes256
-)
-
-// handshake ext filed
-const (
-	hsReq = 1 << iota
-	kmReq
-	config
-)
-
-// Handshake type.
-const (
-	waveHand  = 0
-	induction = 1
-
-	done       = 0xfffffffd
-	agreement  = 0xfffffffe
-	conclusion = 0xffffffff
-)
-
-const headerSize = 0x10
-
-var zeros = make([]byte, 16*4)
-
-func NewConn(p net.PacketConn, addr net.Addr) (c *Conn) {
-	return &Conn{
-		p:    p,
-		addr: addr,
-
-		MaxTransmissonUnit: 1500,
-		MaxFlowWindow:      0x2000,
-
-		stopc: make(chan struct{}),
-	}
-}
-
-func (c *Conn) Connect() (err error) {
-	c.seq = uint32(rand.Int31())
-
-	b := c.encodeInduction(nil)
-
-	_, err = send(tlog.Span{Logger: tlog.DefaultLogger}, c.p, b, c.addr)
-	if err != nil {
-		return errors.Wrap(err, "write induction")
-	}
-
-	// first phase response
-	buf := make([]byte, 2000)
-
-	n, addr, err := c.p.ReadFrom(buf)
-	if err != nil {
-		return errors.Wrap(err, "read packet")
-	}
-
-	ts := low.Monotonic()
-
-	tlog.Printf("packet from %v\n%s", addr, hex.Dump(buf[:n]))
-
-	_ = ts
-
-	go func() {
-		for {
-			err := c.run()
-
-			select {
-			case <-c.stopc:
-				return
-			default:
-			}
-
-			tlog.Printw("run", "err", err)
-		}
-	}()
-
-	return nil
-}
-
-func (c *Conn) Close() (err error) {
-	// send close to the peer
-
-	close(c.stopc)
-
-	return nil
-}
+const mtuHeaders = 6 * 4 // 2 * 4 udp + 4 * 4 srt data header
 
 func (c *Conn) LocalAddr() net.Addr {
 	return c.p.LocalAddr()
@@ -189,229 +46,99 @@ func (c *Conn) RemoteAddr() net.Addr {
 	return c.addr
 }
 
-func (c *Conn) SetDeadline(t time.Time) error {
-	return nil
-}
-
-func (c *Conn) SetReadDeadline(t time.Time) error {
-	return nil
-}
-
-func (c *Conn) SetWriteDeadline(t time.Time) error {
-	return nil
-}
-
-func (c *Conn) run() (err error) {
-	for {
-		buf := make([]byte, 2000)
-
-		n, addr, err := c.p.ReadFrom(buf)
-		if err != nil {
-			return errors.Wrap(err, "read packet")
-		}
-
-		ts := low.Monotonic()
-
-		tlog.Printf("packet from %v\n%s", addr, hex.Dump(buf[:n]))
-
-		err = c.recv(buf[:n], addr, ts)
-		if err != nil {
-			return errors.Wrap(err, "recv")
-		}
-	}
-}
-
-func (c *Conn) encodeInduction(b []byte) []byte {
-	i := len(b)
-	b = append(b, zeros[:16*4]...)
-
-	b = append(b[i:], handshakeHeader...)
-	i += len(handshakeHeader)
-
-	binary.BigEndian.PutUint32(b[i:], 0) // ts
-	i += 4
-
-	// dst socket id
-	i += 4
-
-	binary.BigEndian.PutUint32(b[i:], 4) // version
-	i += 4
-
-	// encryption
-	i += 2
-
-	binary.BigEndian.PutUint16(b[i:], kmReq) // extension
-	i += 2
-
-	binary.BigEndian.PutUint32(b[i:], c.seq)
-	i += 4
-
-	binary.BigEndian.PutUint32(b[i:], uint32(c.MaxTransmissonUnit))
-	i += 4
-
-	binary.BigEndian.PutUint32(b[i:], uint32(c.MaxFlowWindow))
-	i += 4
-
-	binary.BigEndian.PutUint32(b[i:], induction)
-	i += 4
-
-	binary.BigEndian.PutUint32(b[i:], c.localID)
-	i += 4
-
-	// cookie
-	i += 4
-
-	// our ip
-	i += 16
-
-	return b[:i]
-}
-
 func (c *Conn) Write(p []byte) (n int, err error) {
-	size := calcSize(c.MaxTransmissonUnit, len(p))
-
-	defer c.mu.Unlock()
-	c.mu.Lock()
-
-	m := &msg{
-		ts:    uint32((low.Monotonic() - c.epoch) / 1000), // ns to us
-		seq:   c.seq,
-		msg:   c.msg,
-		size:  size,
-		flags: flagO,
-		data:  p,
-	}
-
-	c.seq += uint32(n)
-	c.msg++
-
-	c.sendq.Push(m)
-
-	n, err = c.send(m, m.seq)
-	if err != nil {
-		return n, errors.Wrap(err, "send")
-	}
-
-	return n, nil
-}
-
-func (c *Conn) send(m *msg, seq uint32) (n int, err error) {
-	var nn int
-
-	for i := 0; i < m.size; i++ {
-		m.buf = c.encodeData(m.buf[:0], m, i)
-
-		nn, err = send(tlog.Span{Logger: tlog.DefaultLogger}, c.p, m.buf, c.addr)
-		n += nn
-		if err != nil {
-			return
-		}
-	}
-
-	m.flags |= flagR
-
+	// TODO
+	tlog.Printw("write")
 	return
-}
-
-func (c *Conn) encodeData(b []byte, m *msg, i int) []byte {
-	mtu := c.MaxTransmissonUnit - headerSize
-
-	// data part
-	st := i * mtu
-	end := (i + 1) * mtu
-	if end > len(m.data) {
-		end = len(m.data)
-	}
-
-	i = len(b) // i reused
-	b = append(b, zeros[:0x20]...)
-
-	binary.BigEndian.PutUint32(b[i:], (m.seq+uint32(i))&0x7fff_ffff)
-	i += 4
-
-	binary.BigEndian.PutUint32(b[i:], m.msg&0x7_ffff)
-
-	{ // flags
-		ff := m.flags
-
-		if i == 0 {
-			ff |= flagPPFirst
-		}
-
-		if i == m.size-1 {
-			ff |= flagPPLast
-		}
-
-		b[i] = ff
-	}
-
-	i += 4
-
-	binary.BigEndian.PutUint32(b[i:], m.ts)
-	i += 4
-
-	binary.BigEndian.PutUint32(b[i:], c.remoteID)
-	i += 4
-
-	b = append(b, m.data[st:end]...)
-
-	return b
 }
 
 func (c *Conn) Read(p []byte) (n int, err error) {
-	return 0, nil
-}
+again:
+	n, err = c.r.read(p)
+	tlog.Printw("read", "n", n, "err", err)
+	if err == errWait {
+		<-c.readnotify
 
-func (c *Conn) recv(b []byte, addr net.Addr, ts int64) (err error) {
-	if len(b) < 0x10 {
-		return errors.New("short packet")
+		goto again
 	}
-
-	if b[0]&controlPacket == controlPacket {
-		return c.recvControl(b, addr, ts)
-	}
-
-	return nil
-}
-
-func (c *Conn) recvControl(b []byte, addr net.Addr, ts int64) (err error) {
-	tp := binary.BigEndian.Uint16(b) & 0x7fff
-
-	switch tp {
-	case keepAlive:
-	case shutdown:
-		// mark somehow
-	}
-
-	return nil
-}
-
-func (q *queue) Push(m *msg) {
-	if q.last == nil {
-		q.first = m
-		q.last = m
-	} else {
-		q.last.next = m
-		q.last = m
-	}
-}
-
-func (q *queue) Pop() (m *msg) {
-	if q.first == nil {
-		return nil
-	}
-
-	m = q.first
-	q.first = m.next
 
 	return
 }
 
-func (q *queue) Peek() (m *msg) {
-	return q.first
+func (c *Conn) recv(p wire.Packet, addr net.Addr, ts int64) (err error) {
+	if p.Control() {
+		return c.recvControl(p, addr, ts)
+	}
+
+	dp := wire.DataPacket(p)
+
+	c.r.insert(dp)
+
+	select {
+	case c.readnotify <- struct{}{}:
+	default:
+	}
+
+	err = c.lightAck()
+	if err != nil {
+		return errors.Wrap(err, "send ack")
+	}
+
+	return
 }
 
-func calcSize(mtu, l int) int {
-	mtu -= headerSize
-	return (l + mtu - 1) / mtu
+func (c *Conn) recvControl(p wire.Packet, addr net.Addr, ts int64) (err error) {
+	tp, _ := p.ControlType()
+
+	switch tp {
+	case wire.ShutdownType:
+		c.r.insert(nil)
+
+		select {
+		case c.readnotify <- struct{}{}:
+		default:
+		}
+	default:
+		tlog.Printw("control", "tp", tp)
+	}
+
+	return
+}
+
+func (c *Conn) lightAck() (err error) {
+	p := make(wire.Ack, wire.Ack{}.MinSize())
+
+	n := c.r.ack()
+
+	defer func() {
+		tlog.Printw("ack", "ack", tlog.Hex(n), "err", err)
+	}()
+
+	p.SetAckNum(n + 1)
+
+	wire.Packet(p).SetControlType(wire.AckType, 0)
+
+	return c.sendControl(wire.Packet(p))
+}
+
+func (c *Conn) sendControl(p wire.Packet) (err error) {
+	p.SetTimestamp(low.Monotonic() - c.epoch)
+	p.SetSocketID(c.remoteid)
+
+	_, err = c.p.WriteTo(p, c.addr)
+
+	return errors.Wrap(err, "write")
+}
+
+func (c *Conn) Close() (err error) {
+	p := make(wire.Packet, wire.Packet{}.MinSize())
+
+	p.SetControlType(wire.ShutdownType, 0)
+
+	err = c.sendControl(p)
+	if err != nil {
+		return errors.Wrap(err, "send shutdown packet")
+	}
+
+	return nil
 }
